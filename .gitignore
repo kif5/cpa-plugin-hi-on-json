@@ -1,0 +1,11 @@
+# build outputs
+*.dll
+*.dll.a
+*.so
+*.dylib
+*.h
+
+# local/editor
+.DS_Store
+.vscode/
+.idea/
