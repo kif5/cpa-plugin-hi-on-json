@@ -72,8 +72,9 @@ import (
 )
 
 const (
-	pluginID      = "hi-on-json"
-	pluginVersion = "0.1.0"
+	pluginID           = "hi-on-json"
+	pluginVersion      = "0.1.0"
+	methodHostAuthList = "host.auth.list"
 )
 
 type envelope struct {
@@ -144,8 +145,17 @@ type config struct {
 	SettleDelay  time.Duration `yaml:"-"`
 }
 
+
+type authFileEntry struct {
+	ID        string `json:"id,omitempty"`
+	AuthIndex string `json:"auth_index,omitempty"`
+	Name      string `json:"name"`
+	Provider  string `json:"provider,omitempty"`
+	Path      string `json:"path,omitempty"`
+	Size      int64  `json:"size,omitempty"`
+}
 type authListResponse struct {
-	Files []pluginapi.HostAuthFileEntry `json:"files"`
+	Files []authFileEntry `json:"files"`
 }
 
 type hostModelExecutionRequest struct {
@@ -427,7 +437,7 @@ func (r *runner) loop(cfg config, stop <-chan struct{}, done chan<- struct{}) {
 	}
 }
 
-func (cfg config) matches(f pluginapi.HostAuthFileEntry) bool {
+func (cfg config) matches(f authFileEntry) bool {
 	name := strings.ToLower(strings.TrimSpace(f.Name))
 	path := strings.ToLower(strings.TrimSpace(f.Path))
 	if cfg.NameSuffix != "" {
@@ -452,7 +462,7 @@ func (cfg config) matches(f pluginapi.HostAuthFileEntry) bool {
 	return true
 }
 
-func (r *runner) askForNewAuth(cfg config, f pluginapi.HostAuthFileEntry) {
+func (r *runner) askForNewAuth(cfg config, f authFileEntry) {
 	if cfg.SettleDelay > 0 {
 		time.Sleep(cfg.SettleDelay)
 	}
@@ -489,8 +499,8 @@ func (r *runner) askForNewAuth(cfg config, f pluginapi.HostAuthFileEntry) {
 	_ = logHost("info", "Hi-on-JSON asked prompt for new auth JSON", map[string]any{"auth": displayAuth(f), "prompt": cfg.Prompt, "model": cfg.Model})
 }
 
-func listAuthFiles() ([]pluginapi.HostAuthFileEntry, error) {
-	result, err := callHost(pluginabi.MethodHostAuthList, map[string]any{})
+func listAuthFiles() ([]authFileEntry, error) {
+	result, err := callHost(methodHostAuthList, map[string]any{})
 	if err != nil {
 		return nil, err
 	}
@@ -586,7 +596,7 @@ func (r *runner) setStatus(s string) {
 	r.mu.Unlock()
 }
 
-func authKey(f pluginapi.HostAuthFileEntry) string {
+func authKey(f authFileEntry) string {
 	for _, v := range []string{f.ID, f.AuthIndex, f.Path, f.Name} {
 		if strings.TrimSpace(v) != "" {
 			return v
@@ -595,7 +605,7 @@ func authKey(f pluginapi.HostAuthFileEntry) string {
 	return fmt.Sprintf("%s:%s:%d", f.Provider, f.Name, f.Size)
 }
 
-func displayAuth(f pluginapi.HostAuthFileEntry) string {
+func displayAuth(f authFileEntry) string {
 	name := f.Name
 	if name == "" && f.Path != "" {
 		name = filepath.Base(f.Path)
@@ -660,3 +670,4 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	response.ptr = ptr
 	response.len = C.size_t(len(raw))
 }
+
