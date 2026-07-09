@@ -60,6 +60,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -73,7 +74,7 @@ import (
 
 const (
 	pluginID           = "hi-on-json"
-	pluginVersion      = "0.2.0"
+	pluginVersion      = "0.4.0"
 	methodHostAuthList = "host.auth.list"
 )
 
@@ -135,7 +136,9 @@ type config struct {
 	PollIntervalRaw string   `yaml:"poll_interval"`
 	SettleDelayRaw  string   `yaml:"settle_delay"`
 	RetryIntervalRaw string   `yaml:"retry_interval"`
+	TriggerCooldownRaw string `yaml:"trigger_cooldown"`
 	IncludeExisting bool     `yaml:"include_existing"`
+	PersistState    bool     `yaml:"persist_state"`
 	TriggerOnUpdate bool     `yaml:"trigger_on_update"`
 	RetryFailed     bool     `yaml:"retry_failed"`
 	Providers       []string `yaml:"providers"`
@@ -147,6 +150,7 @@ type config struct {
 	PollInterval time.Duration `yaml:"-"`
 	SettleDelay  time.Duration `yaml:"-"`
 	RetryInterval time.Duration `yaml:"-"`
+	TriggerCooldown time.Duration `yaml:"-"`
 }
 
 
@@ -189,6 +193,8 @@ type runner struct {
 	seen       map[string]string
 	inFlight   map[string]struct{}
 	retryAfter  map[string]time.Time
+	lastTriggered map[string]time.Time
+	statePath string
 	lastStatus string
 	lastError  string
 	lastAsk    time.Time
@@ -261,7 +267,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		state.start(cfg)
+		state.start(cfg, req.PluginDir)
 		return okEnvelope(registration{
 			SchemaVersion: pluginabi.SchemaVersion,
 			Metadata: pluginapi.Metadata{
@@ -276,9 +282,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 					{Name: "poll_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Polling interval, Go duration such as 2s."},
 					{Name: "settle_delay", Type: pluginapi.ConfigFieldTypeString, Description: "Delay after seeing a new JSON before asking, Go duration such as 3s."},
 					{Name: "include_existing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Ask Hi for existing auth JSON records when the plugin starts."},
+					{Name: "persist_state", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Persist seen auth fingerprints in plugin directory to avoid duplicate or missed triggers across restarts."},
 					{Name: "trigger_on_update", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Ask again when an existing auth JSON record changes size/time."},
 					{Name: "retry_failed", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Retry failed Hi requests instead of marking them done."},
 					{Name: "retry_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Retry interval after a failed Hi request, Go duration such as 30s."},
+					{Name: "trigger_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum interval before the same auth JSON can be triggered again by an update, such as 10m. Set 0s to disable."},
 					{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional provider allow-list, e.g. [openai, codex, gemini]. Empty means all providers."},
 					{Name: "name_suffix", Type: pluginapi.ConfigFieldTypeString, Description: "Optional filename suffix filter; default .json."},
 				},
@@ -302,6 +310,8 @@ func defaultConfig() config {
 		PollInterval:  2 * time.Second,
 		SettleDelay:   3 * time.Second,
 		RetryInterval: 30 * time.Second,
+		TriggerCooldown: 10 * time.Minute,
+		PersistState: true,
 		TriggerOnUpdate: true,
 		RetryFailed: true,
 		NameSuffix:    ".json",
@@ -344,6 +354,13 @@ func parseConfig(raw []byte) (config, error) {
 		}
 		cfg.RetryInterval = d
 	}
+	if strings.TrimSpace(cfg.TriggerCooldownRaw) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(cfg.TriggerCooldownRaw))
+		if err != nil || d < 0 {
+			return cfg, fmt.Errorf("invalid trigger_cooldown %q", cfg.TriggerCooldownRaw)
+		}
+		cfg.TriggerCooldown = d
+	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 2 * time.Second
 	}
@@ -352,6 +369,9 @@ func parseConfig(raw []byte) (config, error) {
 	}
 	if cfg.RetryInterval <= 0 {
 		cfg.RetryInterval = 30 * time.Second
+	}
+	if cfg.TriggerCooldown < 0 {
+		cfg.TriggerCooldown = 10 * time.Minute
 	}
 	if strings.TrimSpace(cfg.NameSuffix) == "" {
 		cfg.NameSuffix = ".json"
@@ -368,7 +388,7 @@ func parseConfig(raw []byte) (config, error) {
 	return cfg, nil
 }
 
-func (r *runner) start(cfg config) {
+func (r *runner) start(cfg config, pluginDir string) {
 	r.stopRunner()
 	r.mu.Lock()
 	r.cfg = cfg
@@ -377,6 +397,9 @@ func (r *runner) start(cfg config) {
 	r.seen = make(map[string]string)
 	r.inFlight = make(map[string]struct{})
 	r.retryAfter = make(map[string]time.Time)
+	r.lastTriggered = make(map[string]time.Time)
+	r.statePath = stateFilePath(pluginDir)
+	r.loadPersistedStateLocked(cfg)
 	r.lastError = ""
 	if cfg.Enabled {
 		r.lastStatus = "running"
@@ -425,6 +448,7 @@ func (r *runner) loop(cfg config, stop <-chan struct{}, done chan<- struct{}) {
 				r.seen[authKey(f)] = authFingerprint(f)
 			}
 			r.lastStatus = fmt.Sprintf("running; baseline=%d", len(files))
+			r.savePersistedStateLocked(cfg)
 			r.mu.Unlock()
 		} else {
 			r.setError(err)
@@ -471,8 +495,15 @@ func (r *runner) reserveAsk(cfg config, key, fingerprint string) bool {
 		return false
 	}
 	seenFingerprint, seen := r.seen[key]
-	if seen && (!cfg.TriggerOnUpdate || seenFingerprint == fingerprint) {
-		return false
+	if seen {
+		if !cfg.TriggerOnUpdate || seenFingerprint == fingerprint {
+			return false
+		}
+		if cfg.TriggerCooldown > 0 {
+			if last, ok := r.lastTriggered[key]; ok && now.Sub(last) < cfg.TriggerCooldown {
+				return false
+			}
+		}
 	}
 	r.inFlight[key] = struct{}{}
 	return true
@@ -490,13 +521,16 @@ func (r *runner) finishAsk(cfg config, key, fingerprint string, err error) {
 			return
 		}
 		r.seen[key] = fingerprint
+		r.savePersistedStateLocked(cfg)
 		return
 	}
 	delete(r.retryAfter, key)
 	r.seen[key] = fingerprint
+	r.lastTriggered[key] = time.Now()
 	r.asked++
 	r.lastAsk = time.Now()
 	r.lastError = ""
+	r.savePersistedStateLocked(cfg)
 }
 
 func (cfg config) matches(f authFileEntry) bool {
@@ -553,9 +587,72 @@ func (r *runner) askForNewAuth(cfg config, f authFileEntry, key, fingerprint str
 		_ = logHost("warn", "Hi-on-JSON failed", map[string]any{"auth": displayAuth(f), "error": err.Error(), "retry_failed": cfg.RetryFailed})
 		return
 	}
-	r.finishAsk(cfg, key, fingerprint, nil)
+	finalFingerprint := latestFingerprintForKey(key, fingerprint)
+	r.finishAsk(cfg, key, finalFingerprint, nil)
 	r.setStatus("asked " + cfg.Prompt + " for " + displayAuth(f))
-	_ = logHost("info", "Hi-on-JSON asked prompt for auth JSON", map[string]any{"auth": displayAuth(f), "prompt": cfg.Prompt, "model": cfg.Model, "fingerprint": fingerprint})
+	_ = logHost("info", "Hi-on-JSON asked prompt for auth JSON", map[string]any{"auth": displayAuth(f), "prompt": cfg.Prompt, "model": cfg.Model, "fingerprint": finalFingerprint})
+}
+
+
+type persistedState struct {
+	Seen          map[string]string    `json:"seen"`
+	LastTriggered map[string]time.Time `json:"last_triggered,omitempty"`
+	Asked         int64                `json:"asked_count,omitempty"`
+}
+
+func stateFilePath(pluginDir string) string {
+	if strings.TrimSpace(pluginDir) == "" {
+		return ""
+	}
+	return filepath.Join(pluginDir, pluginID+".state.json")
+}
+
+func (r *runner) loadPersistedStateLocked(cfg config) {
+	if !cfg.PersistState || r.statePath == "" {
+		return
+	}
+	raw, err := os.ReadFile(r.statePath)
+	if err != nil || len(raw) == 0 {
+		return
+	}
+	var st persistedState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		r.lastError = "load persisted state: " + err.Error()
+		return
+	}
+	if st.Seen != nil {
+		for k, v := range st.Seen {
+			r.seen[k] = v
+		}
+	}
+	if st.LastTriggered != nil {
+		for k, v := range st.LastTriggered {
+			r.lastTriggered[k] = v
+		}
+	}
+	if st.Asked > r.asked {
+		r.asked = st.Asked
+	}
+}
+
+func (r *runner) savePersistedStateLocked(cfg config) {
+	if !cfg.PersistState || r.statePath == "" {
+		return
+	}
+	st := persistedState{
+		Seen:           r.seen,
+		LastTriggered:  r.lastTriggered,
+		Asked:          r.asked,
+	}
+	raw, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		r.lastError = "marshal persisted state: " + err.Error()
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(r.statePath), 0755)
+	if err := os.WriteFile(r.statePath, raw, 0644); err != nil {
+		r.lastError = "write persisted state: " + err.Error()
+	}
 }
 
 func listAuthFiles() ([]authFileEntry, error) {
@@ -568,6 +665,22 @@ func listAuthFiles() ([]authFileEntry, error) {
 		return nil, fmt.Errorf("decode host.auth.list: %w", err)
 	}
 	return resp.Files, nil
+}
+
+func latestFingerprintForKey(key, fallback string) string {
+	// Give CLIProxyAPI a brief moment to flush auth runtime/file metadata that may
+	// be updated by the successful Hi call itself, then absorb that latest state.
+	time.Sleep(1 * time.Second)
+	files, err := listAuthFiles()
+	if err != nil {
+		return fallback
+	}
+	for _, f := range files {
+		if authKey(f) == key {
+			return authFingerprint(f)
+		}
+	}
+	return fallback
 }
 
 func executeModel(req hostModelExecutionRequest) (pluginapi.HostModelExecutionResponse, error) {
@@ -705,6 +818,7 @@ func statusPage() managementResponse {
 		"asked_count": state.asked,
 		"last_ask":    state.lastAsk.Format(time.RFC3339),
 		"config":      state.cfg,
+		"state_path":  state.statePath,
 	}
 	state.mu.Unlock()
 	raw, _ := json.MarshalIndent(data, "", "  ")

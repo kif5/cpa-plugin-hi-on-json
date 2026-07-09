@@ -35,33 +35,29 @@ plugins:
       prompt: "Hi"
       poll_interval: "2s"
       settle_delay: "3s"
-      include_existing: false
+      include_existing: true
+      persist_state: true
       trigger_on_update: true
       retry_failed: true
       retry_interval: "30s"
+      trigger_cooldown: "10m"
       # providers: ["openai", "codex"]   # 可选：只监听这些 provider
       name_suffix: ".json"
 ```
 
-`include_existing: false` 表示插件启动时已有的 JSON 不触发，只对之后新落地/新识别的 JSON 触发。
+## 防漏与防重复建议
 
-## 防漏触发建议
-
-v0.2.0 起新增：
+v0.4.0 起推荐线上这样配：
 
 ```yaml
-trigger_on_update: true   # 同名/同账号 JSON 文件更新时间或大小变化时也触发
-retry_failed: true        # Hi 请求失败时不标记完成，后面继续重试
-retry_interval: "30s"     # 失败后重试间隔
+include_existing: true     # 避免 API 同步期间/重启期间新增的 JSON 被 baseline 跳过
+persist_state: true        # 持久化已处理列表，避免重启后旧 JSON 全部重触发
+trigger_on_update: true    # 同名/同账号 JSON 文件更新时间或大小变化时也触发
+retry_failed: true         # Hi 请求失败时不标记完成，后面继续重试
+retry_interval: "30s"      # 失败后重试间隔
+trigger_cooldown: "10m"    # 同一个 auth 因 WRITE 更新再次触发的最小间隔；0s 表示关闭冷却
 ```
 
-推荐线上配置：
+如果同步工具会批量重写所有 JSON，建议 `trigger_cooldown` 设成 `10m` 到 `60m`，避免一轮同步造成重复调用。
 
-```yaml
-include_existing: false
-trigger_on_update: true
-retry_failed: true
-retry_interval: "30s"
-```
-
-这样可以避免 API 同步/覆盖 JSON 时只产生 WRITE 事件而漏触发，也能避免上游临时失败导致永久漏掉。
+状态页会显示 `state_path`，默认状态文件在插件目录下：`hi-on-json.state.json`。
