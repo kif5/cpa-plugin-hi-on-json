@@ -74,8 +74,12 @@ import (
 
 const (
 	pluginID           = "hi-on-json"
-	pluginVersion      = "0.5.0"
+	pluginVersion      = "0.6.0"
 	methodHostAuthList = "host.auth.list"
+	methodSchedulerPick = "scheduler.pick"
+	hiPinAuthHeader    = "X-Hi-On-JSON-Auth-ID"
+	hiPinIndexHeader   = "X-Hi-On-JSON-Auth-Index"
+	hostModelCallbackSource = "plugin_host_model_callback"
 )
 
 type envelope struct {
@@ -102,6 +106,7 @@ type registration struct {
 
 type registrationCapabilities struct {
 	ManagementAPI bool `json:"management_api"`
+	Scheduler     bool `json:"scheduler"`
 }
 
 type managementRegistration struct {
@@ -169,6 +174,32 @@ type authFileEntry struct {
 }
 type authListResponse struct {
 	Files []authFileEntry `json:"files"`
+}
+
+type schedulerPickRequest struct {
+	Provider   string                   `json:"Provider"`
+	Providers  []string                 `json:"Providers"`
+	Model      string                   `json:"Model"`
+	Stream     bool                     `json:"Stream"`
+	Options    schedulerOptions         `json:"Options"`
+	Candidates []schedulerAuthCandidate `json:"Candidates"`
+}
+
+type schedulerOptions struct {
+	Headers  map[string][]string `json:"Headers"`
+	Metadata map[string]any      `json:"Metadata"`
+}
+
+type schedulerAuthCandidate struct {
+	ID       string `json:"ID"`
+	Provider string `json:"Provider"`
+	Status   string `json:"Status"`
+}
+
+type schedulerPickResponse struct {
+	AuthID          string `json:"AuthID,omitempty"`
+	DelegateBuiltin string `json:"DelegateBuiltin,omitempty"`
+	Handled         bool   `json:"Handled"`
 }
 
 type hostModelExecutionRequest struct {
@@ -283,9 +314,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 					{Name: "prompt", Type: pluginapi.ConfigFieldTypeString, Description: "Prompt sent for every newly discovered JSON auth record; default: Hi."},
 					{Name: "poll_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Polling interval, Go duration such as 2s."},
 					{Name: "settle_delay", Type: pluginapi.ConfigFieldTypeString, Description: "Delay after seeing a new JSON before asking, Go duration such as 3s."},
-					{Name: "include_existing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Deprecated in v0.5.0 call-record mode; host success/failed counters decide whether to ask."},
-					{Name: "persist_state", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Optional legacy state persistence. Not needed in v0.5.0 call-record mode; default false."},
-					{Name: "trigger_on_update", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Deprecated in v0.5.0 call-record mode; auths with existing success/failed counters are skipped."},
+					{Name: "include_existing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Deprecated in v0.6.0 call-record mode; host success/failed counters decide whether to ask."},
+					{Name: "persist_state", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Optional legacy state persistence. Not needed in v0.6.0 call-record mode; default false."},
+					{Name: "trigger_on_update", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Deprecated in v0.6.0 call-record mode; auths with existing success/failed counters are skipped."},
 					{Name: "retry_failed", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Retry failed Hi requests instead of marking them done."},
 					{Name: "retry_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Retry interval after a failed Hi request, Go duration such as 30s."},
 					{Name: "trigger_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "Anti-race cooldown after this plugin sends Hi while waiting for success counter to update, such as 10m."},
@@ -293,8 +324,14 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 					{Name: "name_suffix", Type: pluginapi.ConfigFieldTypeString, Description: "Optional filename suffix filter; default .json."},
 				},
 			},
-			Capabilities: registrationCapabilities{ManagementAPI: true},
+			Capabilities: registrationCapabilities{ManagementAPI: true, Scheduler: true},
 		})
+	case methodSchedulerPick:
+		resp, err := handleSchedulerPick(request)
+		if err != nil {
+			return errorEnvelope("scheduler_pick_failed", err.Error()), nil
+		}
+		return okEnvelope(resp)
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration{Resources: []managementResource{{Path: "/status", Menu: "Hi on JSON", Description: "Shows automatic Hi-on-new-auth-JSON status."}}})
 	case pluginabi.MethodManagementHandle:
@@ -442,7 +479,7 @@ func (r *runner) stopRunner() {
 
 func (r *runner) loop(cfg config, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
-	// v0.5.0: do not baseline-skip existing auths. The source of truth is the
+	// v0.6.0: do not baseline-skip existing auths. The source of truth is the
 	// host auth call counters. If success+failed == 0, this auth has no call
 	// record and should receive exactly one Hi probe.
 	ticker := time.NewTicker(cfg.PollInterval)
@@ -579,13 +616,20 @@ func (r *runner) askForNewAuth(cfg config, f authFileEntry, key, fingerprint str
 			Content: msg,
 		}},
 	})
+	headers := http.Header{}
+	if strings.TrimSpace(f.ID) != "" {
+		headers.Set(hiPinAuthHeader, strings.TrimSpace(f.ID))
+	}
+	if strings.TrimSpace(f.AuthIndex) != "" {
+		headers.Set(hiPinIndexHeader, strings.TrimSpace(f.AuthIndex))
+	}
 	_, err := executeModel(hostModelExecutionRequest{HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
 		EntryProtocol: cfg.EntryProtocol,
 		ExitProtocol:  cfg.ExitProtocol,
 		Model:         cfg.Model,
 		Stream:        false,
 		Body:          body,
-		Headers:       http.Header{},
+		Headers:       headers,
 		Query:         url.Values{},
 		Alt:           cfg.Alt,
 	}})
@@ -661,6 +705,64 @@ func (r *runner) savePersistedStateLocked(cfg config) {
 	if err := os.WriteFile(r.statePath, raw, 0644); err != nil {
 		r.lastError = "write persisted state: " + err.Error()
 	}
+}
+
+func handleSchedulerPick(request []byte) (schedulerPickResponse, error) {
+	var req schedulerPickRequest
+	if len(request) == 0 {
+		return schedulerPickResponse{}, nil
+	}
+	if err := json.Unmarshal(request, &req); err != nil {
+		return schedulerPickResponse{}, nil
+	}
+	// Only route the internal host.model.execute call started by this plugin.
+	// This keeps normal user traffic on CLIProxyAPI's built-in scheduler.
+	if !metadataSourceIsHostCallback(req.Options.Metadata) {
+		return schedulerPickResponse{}, nil
+	}
+	pinnedID := strings.TrimSpace(firstHeaderValue(req.Options.Headers, hiPinAuthHeader))
+	if pinnedID == "" {
+		return schedulerPickResponse{}, nil
+	}
+	for _, candidate := range req.Candidates {
+		if strings.TrimSpace(candidate.ID) == pinnedID {
+			return schedulerPickResponse{Handled: true, AuthID: pinnedID}, nil
+		}
+	}
+	return schedulerPickResponse{}, fmt.Errorf("pinned auth %s is not available for model %s", pinnedID, strings.TrimSpace(req.Model))
+}
+
+func metadataSourceIsHostCallback(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	raw, ok := meta["source"]
+	if !ok {
+		return false
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), hostModelCallbackSource)
+	default:
+		return false
+	}
+}
+
+func firstHeaderValue(headers map[string][]string, name string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	for k, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(k), name) {
+			continue
+		}
+		for _, v := range values {
+			if out := strings.TrimSpace(v); out != "" {
+				return out
+			}
+		}
+	}
+	return ""
 }
 
 func listAuthFiles() ([]authFileEntry, error) {

@@ -2,7 +2,7 @@
 
 CLIProxyAPI native plugin: 自动给“没有调用记录”的 auth JSON 发起一次 `Hi` 探测。
 
-## 核心逻辑 v0.5.0
+## 核心逻辑 v0.6.0
 
 插件不再依赖长期状态文件，也不靠 `include_existing` 判断。
 
@@ -14,6 +14,8 @@ CLIProxyAPI native plugin: 自动给“没有调用记录”的 auth JSON 发起
 ```
 
 因此无论 JSON 是手动上传、API 同步、复制进目录还是其它方式进来的，只要 CLIProxyAPI 能在 auth 列表里看到它，并且后台成功/失败计数都是 0，插件就会补一次 `Hi`。
+
+v0.6.0 还会在插件自己触发 `Hi` 时临时通过 scheduler 把请求固定到当前这个 auth ID，避免 `Hi` 被 CLIProxyAPI 轮询到其它账号，导致“插件 asked_count 增加，但这个 JSON 卡片仍然成功 0”的问题。
 
 ## 推荐配置
 
@@ -38,7 +40,7 @@ plugins:
 
 说明：
 
-- `persist_state: false`：v0.5.0 推荐关闭，不需要状态文件。
+- `persist_state: false`：v0.6.0 推荐关闭，不需要状态文件。
 - `trigger_cooldown: "10m"`：插件自己发完 Hi 后，等待后台成功计数更新期间，避免同一个 auth 被连续触发多次。
 - `retry_failed: true`：如果 Hi 请求失败，后面继续重试。
 
