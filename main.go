@@ -73,7 +73,7 @@ import (
 
 const (
 	pluginID           = "hi-on-json"
-	pluginVersion      = "0.1.0"
+	pluginVersion      = "0.2.0"
 	methodHostAuthList = "host.auth.list"
 )
 
@@ -134,7 +134,10 @@ type config struct {
 	Prompt          string   `yaml:"prompt"`
 	PollIntervalRaw string   `yaml:"poll_interval"`
 	SettleDelayRaw  string   `yaml:"settle_delay"`
+	RetryIntervalRaw string   `yaml:"retry_interval"`
 	IncludeExisting bool     `yaml:"include_existing"`
+	TriggerOnUpdate bool     `yaml:"trigger_on_update"`
+	RetryFailed     bool     `yaml:"retry_failed"`
 	Providers       []string `yaml:"providers"`
 	NameSuffix      string   `yaml:"name_suffix"`
 	EntryProtocol   string   `yaml:"entry_protocol"`
@@ -143,6 +146,7 @@ type config struct {
 
 	PollInterval time.Duration `yaml:"-"`
 	SettleDelay  time.Duration `yaml:"-"`
+	RetryInterval time.Duration `yaml:"-"`
 }
 
 
@@ -153,6 +157,9 @@ type authFileEntry struct {
 	Provider  string `json:"provider,omitempty"`
 	Path      string `json:"path,omitempty"`
 	Size      int64  `json:"size,omitempty"`
+	ModTime   time.Time `json:"modtime,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 type authListResponse struct {
 	Files []authFileEntry `json:"files"`
@@ -179,7 +186,9 @@ type runner struct {
 	cfg        config
 	stop       chan struct{}
 	done       chan struct{}
-	seen       map[string]struct{}
+	seen       map[string]string
+	inFlight   map[string]struct{}
+	retryAfter  map[string]time.Time
 	lastStatus string
 	lastError  string
 	lastAsk    time.Time
@@ -267,6 +276,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 					{Name: "poll_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Polling interval, Go duration such as 2s."},
 					{Name: "settle_delay", Type: pluginapi.ConfigFieldTypeString, Description: "Delay after seeing a new JSON before asking, Go duration such as 3s."},
 					{Name: "include_existing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Ask Hi for existing auth JSON records when the plugin starts."},
+					{Name: "trigger_on_update", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Ask again when an existing auth JSON record changes size/time."},
+					{Name: "retry_failed", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Retry failed Hi requests instead of marking them done."},
+					{Name: "retry_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Retry interval after a failed Hi request, Go duration such as 30s."},
 					{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional provider allow-list, e.g. [openai, codex, gemini]. Empty means all providers."},
 					{Name: "name_suffix", Type: pluginapi.ConfigFieldTypeString, Description: "Optional filename suffix filter; default .json."},
 				},
@@ -289,6 +301,9 @@ func defaultConfig() config {
 		Prompt:        "Hi",
 		PollInterval:  2 * time.Second,
 		SettleDelay:   3 * time.Second,
+		RetryInterval: 30 * time.Second,
+		TriggerOnUpdate: true,
+		RetryFailed: true,
 		NameSuffix:    ".json",
 		EntryProtocol: "openai",
 		ExitProtocol:  "openai",
@@ -322,11 +337,21 @@ func parseConfig(raw []byte) (config, error) {
 		}
 		cfg.SettleDelay = d
 	}
+	if strings.TrimSpace(cfg.RetryIntervalRaw) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(cfg.RetryIntervalRaw))
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid retry_interval %q", cfg.RetryIntervalRaw)
+		}
+		cfg.RetryInterval = d
+	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 2 * time.Second
 	}
 	if cfg.SettleDelay < 0 {
 		cfg.SettleDelay = 3 * time.Second
+	}
+	if cfg.RetryInterval <= 0 {
+		cfg.RetryInterval = 30 * time.Second
 	}
 	if strings.TrimSpace(cfg.NameSuffix) == "" {
 		cfg.NameSuffix = ".json"
@@ -349,7 +374,9 @@ func (r *runner) start(cfg config) {
 	r.cfg = cfg
 	r.stop = make(chan struct{})
 	r.done = make(chan struct{})
-	r.seen = make(map[string]struct{})
+	r.seen = make(map[string]string)
+	r.inFlight = make(map[string]struct{})
+	r.retryAfter = make(map[string]time.Time)
 	r.lastError = ""
 	if cfg.Enabled {
 		r.lastStatus = "running"
@@ -395,7 +422,7 @@ func (r *runner) loop(cfg config, stop <-chan struct{}, done chan<- struct{}) {
 		if err == nil {
 			r.mu.Lock()
 			for _, f := range files {
-				r.seen[authKey(f)] = struct{}{}
+				r.seen[authKey(f)] = authFingerprint(f)
 			}
 			r.lastStatus = fmt.Sprintf("running; baseline=%d", len(files))
 			r.mu.Unlock()
@@ -416,25 +443,60 @@ func (r *runner) loop(cfg config, stop <-chan struct{}, done chan<- struct{}) {
 				r.setError(err)
 				continue
 			}
+			queued := 0
 			for _, f := range files {
 				if !cfg.matches(f) {
 					continue
 				}
 				key := authKey(f)
-				r.mu.Lock()
-				_, exists := r.seen[key]
-				if !exists {
-					r.seen[key] = struct{}{}
+				fp := authFingerprint(f)
+				if r.reserveAsk(cfg, key, fp) {
+					queued++
+					go r.askForNewAuth(cfg, f, key, fp)
 				}
-				r.mu.Unlock()
-				if exists {
-					continue
-				}
-				go r.askForNewAuth(cfg, f)
 			}
-			r.setStatus(fmt.Sprintf("running; seen=%d", len(files)))
+			r.setStatus(fmt.Sprintf("running; seen=%d queued=%d", len(files), queued))
 		}
 	}
+}
+
+func (r *runner) reserveAsk(cfg config, key, fingerprint string) bool {
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, busy := r.inFlight[key]; busy {
+		return false
+	}
+	if retryAt, ok := r.retryAfter[key]; ok && now.Before(retryAt) {
+		return false
+	}
+	seenFingerprint, seen := r.seen[key]
+	if seen && (!cfg.TriggerOnUpdate || seenFingerprint == fingerprint) {
+		return false
+	}
+	r.inFlight[key] = struct{}{}
+	return true
+}
+
+func (r *runner) finishAsk(cfg config, key, fingerprint string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.inFlight, key)
+	if err != nil {
+		r.lastError = err.Error()
+		r.lastStatus = "error"
+		if cfg.RetryFailed {
+			r.retryAfter[key] = time.Now().Add(cfg.RetryInterval)
+			return
+		}
+		r.seen[key] = fingerprint
+		return
+	}
+	delete(r.retryAfter, key)
+	r.seen[key] = fingerprint
+	r.asked++
+	r.lastAsk = time.Now()
+	r.lastError = ""
 }
 
 func (cfg config) matches(f authFileEntry) bool {
@@ -462,7 +524,7 @@ func (cfg config) matches(f authFileEntry) bool {
 	return true
 }
 
-func (r *runner) askForNewAuth(cfg config, f authFileEntry) {
+func (r *runner) askForNewAuth(cfg config, f authFileEntry, key, fingerprint string) {
 	if cfg.SettleDelay > 0 {
 		time.Sleep(cfg.SettleDelay)
 	}
@@ -486,17 +548,14 @@ func (r *runner) askForNewAuth(cfg config, f authFileEntry) {
 		Alt:           cfg.Alt,
 	}})
 	if err != nil {
-		r.setError(fmt.Errorf("ask %q for %s failed: %w", cfg.Prompt, displayAuth(f), err))
-		_ = logHost("warn", "Hi-on-JSON failed", map[string]any{"auth": displayAuth(f), "error": err.Error()})
+		wrapped := fmt.Errorf("ask %q for %s failed: %w", cfg.Prompt, displayAuth(f), err)
+		r.finishAsk(cfg, key, fingerprint, wrapped)
+		_ = logHost("warn", "Hi-on-JSON failed", map[string]any{"auth": displayAuth(f), "error": err.Error(), "retry_failed": cfg.RetryFailed})
 		return
 	}
-	r.mu.Lock()
-	r.asked++
-	r.lastAsk = time.Now()
-	r.lastError = ""
-	r.lastStatus = "asked " + cfg.Prompt + " for " + displayAuth(f)
-	r.mu.Unlock()
-	_ = logHost("info", "Hi-on-JSON asked prompt for new auth JSON", map[string]any{"auth": displayAuth(f), "prompt": cfg.Prompt, "model": cfg.Model})
+	r.finishAsk(cfg, key, fingerprint, nil)
+	r.setStatus("asked " + cfg.Prompt + " for " + displayAuth(f))
+	_ = logHost("info", "Hi-on-JSON asked prompt for auth JSON", map[string]any{"auth": displayAuth(f), "prompt": cfg.Prompt, "model": cfg.Model, "fingerprint": fingerprint})
 }
 
 func listAuthFiles() ([]authFileEntry, error) {
@@ -603,6 +662,23 @@ func authKey(f authFileEntry) string {
 		}
 	}
 	return fmt.Sprintf("%s:%s:%d", f.Provider, f.Name, f.Size)
+}
+
+func authFingerprint(f authFileEntry) string {
+	parts := []string{
+		f.ID,
+		f.AuthIndex,
+		f.Path,
+		f.Name,
+		f.Provider,
+		fmt.Sprintf("size=%d", f.Size),
+	}
+	// Use physical file modification time when available. Avoid runtime UpdatedAt
+	// because normal model calls may change auth runtime metadata and cause loops.
+	if !f.ModTime.IsZero() {
+		parts = append(parts, "modtime="+f.ModTime.UTC().Format(time.RFC3339Nano))
+	}
+	return strings.Join(parts, "|")
 }
 
 func displayAuth(f authFileEntry) string {
