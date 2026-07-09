@@ -74,7 +74,7 @@ import (
 
 const (
 	pluginID           = "hi-on-json"
-	pluginVersion      = "0.4.0"
+	pluginVersion      = "0.5.0"
 	methodHostAuthList = "host.auth.list"
 )
 
@@ -164,6 +164,8 @@ type authFileEntry struct {
 	ModTime   time.Time `json:"modtime,omitempty"`
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 	CreatedAt time.Time `json:"created_at,omitempty"`
+	Success   int64     `json:"success,omitempty"`
+	Failed    int64     `json:"failed,omitempty"`
 }
 type authListResponse struct {
 	Files []authFileEntry `json:"files"`
@@ -281,12 +283,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 					{Name: "prompt", Type: pluginapi.ConfigFieldTypeString, Description: "Prompt sent for every newly discovered JSON auth record; default: Hi."},
 					{Name: "poll_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Polling interval, Go duration such as 2s."},
 					{Name: "settle_delay", Type: pluginapi.ConfigFieldTypeString, Description: "Delay after seeing a new JSON before asking, Go duration such as 3s."},
-					{Name: "include_existing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Ask Hi for existing auth JSON records when the plugin starts."},
-					{Name: "persist_state", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Persist seen auth fingerprints in plugin directory to avoid duplicate or missed triggers across restarts."},
-					{Name: "trigger_on_update", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Ask again when an existing auth JSON record changes size/time."},
+					{Name: "include_existing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Deprecated in v0.5.0 call-record mode; host success/failed counters decide whether to ask."},
+					{Name: "persist_state", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Optional legacy state persistence. Not needed in v0.5.0 call-record mode; default false."},
+					{Name: "trigger_on_update", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Deprecated in v0.5.0 call-record mode; auths with existing success/failed counters are skipped."},
 					{Name: "retry_failed", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Retry failed Hi requests instead of marking them done."},
 					{Name: "retry_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Retry interval after a failed Hi request, Go duration such as 30s."},
-					{Name: "trigger_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "Minimum interval before the same auth JSON can be triggered again by an update, such as 10m. Set 0s to disable."},
+					{Name: "trigger_cooldown", Type: pluginapi.ConfigFieldTypeString, Description: "Anti-race cooldown after this plugin sends Hi while waiting for success counter to update, such as 10m."},
 					{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional provider allow-list, e.g. [openai, codex, gemini]. Empty means all providers."},
 					{Name: "name_suffix", Type: pluginapi.ConfigFieldTypeString, Description: "Optional filename suffix filter; default .json."},
 				},
@@ -311,7 +313,7 @@ func defaultConfig() config {
 		SettleDelay:   3 * time.Second,
 		RetryInterval: 30 * time.Second,
 		TriggerCooldown: 10 * time.Minute,
-		PersistState: true,
+		PersistState: false,
 		TriggerOnUpdate: true,
 		RetryFailed: true,
 		NameSuffix:    ".json",
@@ -440,20 +442,9 @@ func (r *runner) stopRunner() {
 
 func (r *runner) loop(cfg config, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
-	if !cfg.IncludeExisting {
-		files, err := listAuthFiles()
-		if err == nil {
-			r.mu.Lock()
-			for _, f := range files {
-				r.seen[authKey(f)] = authFingerprint(f)
-			}
-			r.lastStatus = fmt.Sprintf("running; baseline=%d", len(files))
-			r.savePersistedStateLocked(cfg)
-			r.mu.Unlock()
-		} else {
-			r.setError(err)
-		}
-	}
+	// v0.5.0: do not baseline-skip existing auths. The source of truth is the
+	// host auth call counters. If success+failed == 0, this auth has no call
+	// record and should receive exactly one Hi probe.
 	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
 	for {
@@ -468,20 +459,40 @@ func (r *runner) loop(cfg config, stop <-chan struct{}, done chan<- struct{}) {
 				continue
 			}
 			queued := 0
+			noRecord := 0
+			withRecord := 0
 			for _, f := range files {
 				if !cfg.matches(f) {
 					continue
 				}
 				key := authKey(f)
+				if hasCallRecord(f) {
+					withRecord++
+					r.markHasCallRecord(cfg, key, authFingerprint(f))
+					continue
+				}
+				noRecord++
 				fp := authFingerprint(f)
 				if r.reserveAsk(cfg, key, fp) {
 					queued++
 					go r.askForNewAuth(cfg, f, key, fp)
 				}
 			}
-			r.setStatus(fmt.Sprintf("running; seen=%d queued=%d", len(files), queued))
+			r.setStatus(fmt.Sprintf("running; total=%d no_record=%d with_record=%d queued=%d", len(files), noRecord, withRecord, queued))
 		}
 	}
+}
+
+func hasCallRecord(f authFileEntry) bool {
+	return f.Success > 0 || f.Failed > 0
+}
+
+func (r *runner) markHasCallRecord(cfg config, key, fingerprint string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen[key] = fingerprint
+	delete(r.retryAfter, key)
+	delete(r.inFlight, key)
 }
 
 func (r *runner) reserveAsk(cfg config, key, fingerprint string) bool {
@@ -494,15 +505,12 @@ func (r *runner) reserveAsk(cfg config, key, fingerprint string) bool {
 	if retryAt, ok := r.retryAfter[key]; ok && now.Before(retryAt) {
 		return false
 	}
-	seenFingerprint, seen := r.seen[key]
-	if seen {
-		if !cfg.TriggerOnUpdate || seenFingerprint == fingerprint {
+	// Anti-race: after this plugin successfully sends Hi, CLIProxyAPI may need a
+	// short time to update the visible success counter. During cooldown, do not
+	// send another Hi for the same auth even if success is still shown as 0.
+	if cfg.TriggerCooldown > 0 {
+		if last, ok := r.lastTriggered[key]; ok && now.Sub(last) < cfg.TriggerCooldown {
 			return false
-		}
-		if cfg.TriggerCooldown > 0 {
-			if last, ok := r.lastTriggered[key]; ok && now.Sub(last) < cfg.TriggerCooldown {
-				return false
-			}
 		}
 	}
 	r.inFlight[key] = struct{}{}
